@@ -724,28 +724,12 @@ impl BoxImpl {
         // Cancel the token - signals all in-flight operations to abort
         self.shutdown_token.cancel();
 
-        // Only attempt graceful shutdown for boxes that should have a live
-        // shim. Calling live_state() on Configured/Failed would route
-        // through the restart pipeline and spawn a new VM — exactly what
-        // stop() must NOT do.
+        // Only stop boxes that should have a live shim. Calling live_state() on
+        // Configured/Failed would route through restart and spawn a new VM.
+        // The handler owns the complete graceful sequence: signal shim → guest
+        // teardown/sync/reset → libkrun return → bounded hard-kill fallback.
         let should_attach = self.state.read().status == BoxStatus::Running;
         if should_attach && let Ok(live) = self.ensure_booted().await {
-            // Recovered boxes lazy-attach here via vmm_attach (now
-            // ProcessIdentity-gated). Live boxes hit the cached LiveState.
-            // Either way the teardown is identical:
-            let guest_shutdown = async {
-                if let Ok(mut guest) = live.guest_session.guest().await {
-                    let _ = guest.shutdown().await;
-                }
-            };
-            if tokio::time::timeout(Duration::from_secs(10), guest_shutdown)
-                .await
-                .is_err()
-            {
-                tracing::warn!(box_id = %self.config.id, "Guest shutdown timed out after 10s");
-            }
-
-            // Stop handler
             if let Ok(mut handler) = live.handler.lock() {
                 handler.stop()?;
             }

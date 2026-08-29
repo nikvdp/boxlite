@@ -78,16 +78,14 @@ impl ShimHandler {
         }
     }
 
-    /// Graceful shutdown of the recorded process: SIGTERM, wait, then SIGKILL.
+    /// Gracefully stop the recorded process: SIGTERM, wait, then SIGKILL.
     ///
-    /// Signals only `self.pid` (the outer launcher). The full process-tree
-    /// sweep happens in `stop()` after this returns — see the comment there for
-    /// why the order matters (libkrun must flush before the hard cgroup kill).
+    /// Used when the jailer cannot manage a Linux cgroup and on platforms such
+    /// as macOS where the recorded process is the shim. The five-second bound
+    /// matches the shim's graceful shutdown allowance and exceeds its
+    /// three-second guest-sync RPC timeout.
     fn graceful_stop(&mut self) -> BoxliteResult<()> {
-        // Graceful shutdown: SIGTERM first, wait, then SIGKILL if needed.
-        // This gives libkrun time to flush its virtio-blk buffers to disk,
-        // preventing qcow2 corruption.
-        const GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 2000;
+        const GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
         if let Some(mut process) = self.process.take() {
             // Step 1: Send SIGTERM for graceful shutdown
@@ -173,17 +171,18 @@ impl VmmHandlerTrait for ShimHandler {
     }
 
     fn stop(&mut self) -> BoxliteResult<()> {
-        // Graceful shutdown of the recorded pid first, then sweep the box's
-        // whole tree. `graceful_stop` only signals the recorded pid — the outer
-        // bwrap launcher — and a detached box's inner pid-ns tree (inner bwrap +
-        // shim + VM) outlives it, since #851 stopped applying `--die-with-parent`
-        // to detached boxes. The whole tree lives in the box's cgroup, so reap it
-        // by id — *after* graceful shutdown, so libkrun can flush its virtio-blk
-        // buffers first (a cgroup kill is a hard kill; reaping mid-flush risks
-        // qcow2 corruption). Best-effort and idempotent.
-        let result = self.graceful_stop();
-        crate::jailer::reap_box(&self.box_id);
-        result
+        // Linux detached boxes have an outer launcher plus a surviving inner
+        // pid-namespace tree. The jailer finds and signals the shim through the
+        // box cgroup so it can sync the guest before any hard kill. Boxes
+        // without a cgroup (including macOS) retain recorded-PID teardown.
+        if crate::jailer::reap_box(&self.box_id) {
+            if let Some(mut process) = self.process.take() {
+                let _ = process.wait();
+            }
+            Ok(())
+        } else {
+            self.graceful_stop()
+        }
     }
 
     fn metrics(&self) -> BoxliteResult<VmmMetrics> {
