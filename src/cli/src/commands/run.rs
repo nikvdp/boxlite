@@ -87,7 +87,7 @@ impl BoxRunner {
         // Detach mode: start it and get out of the way. Nobody is reading the
         // output, so there is nothing to be attached for.
         if self.args.management.detach {
-            litebox.start().await?;
+            litebox.start_and_wait().await?;
             println!("{}", litebox.id());
             return Ok(0);
         }
@@ -97,7 +97,7 @@ impl BoxRunner {
         // lands, and its output and exit code die with the VM. Attaching only
         // creates the container; `start()` runs its init.
         let mut execution = litebox.attach(None).await?;
-        litebox.start().await?;
+        litebox.start_and_wait().await?;
 
         // --tty implies --interactive when stdin is a terminal
         // (validate_flags already ensures stdin is a terminal when --tty is set)

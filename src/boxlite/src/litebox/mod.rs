@@ -104,6 +104,14 @@ impl LiteBox {
         self.box_backend.start().await
     }
 
+    /// Start the box and wait until its container init has been accepted.
+    ///
+    /// Short-lived clients should use this instead of `start()` so the process
+    /// cannot exit while the local backend's asynchronous start is still pending.
+    pub async fn start_and_wait(&self) -> BoxliteResult<()> {
+        self.box_backend.start_and_wait().await
+    }
+
     pub async fn exec(&self, command: BoxCommand) -> BoxliteResult<Execution> {
         self.box_backend.exec(command).await
     }
