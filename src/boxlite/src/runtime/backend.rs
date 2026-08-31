@@ -78,6 +78,14 @@ pub(crate) trait BoxBackend: Send + Sync {
 
     async fn start(&self) -> BoxliteResult<()>;
 
+    /// Start the box and wait until its container init has been accepted.
+    ///
+    /// Backends whose `start()` already waits may use this default. The local
+    /// backend overrides it because its public SDK start remains asynchronous.
+    async fn start_and_wait(&self) -> BoxliteResult<()> {
+        self.start().await
+    }
+
     async fn exec(&self, command: BoxCommand) -> BoxliteResult<Execution>;
 
     /// Attach to a session in the box.

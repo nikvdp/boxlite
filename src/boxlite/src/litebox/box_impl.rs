@@ -357,6 +357,31 @@ impl BoxImpl {
         Ok(())
     }
 
+    /// Start the box and wait for the existing container-start single-flight.
+    ///
+    /// The public SDK `start()` remains asynchronous. CLI and server paths use
+    /// this operation because their runtimes may be dropped as soon as the
+    /// command returns.
+    pub(crate) async fn start_and_wait(&self) -> BoxliteResult<()> {
+        self.start().await?;
+
+        let live = self.ensure_booted().await?;
+        let started_here = Self::ensure_container_started_owned(
+            Arc::clone(&self.container_start),
+            live.guest_session.clone(),
+            self.container_id().to_owned(),
+            self.shutdown_token.child_token(),
+        )
+        .await?;
+
+        if started_here {
+            for listener in &self.event_listeners {
+                listener.on_box_started(&self.config.id);
+            }
+        }
+        Ok(())
+    }
+
     /// Guard every operation that would lazily boot the VM.
     ///
     /// Booting is no longer neutral. The box's init *is* its main command now,
@@ -699,28 +724,12 @@ impl BoxImpl {
         // Cancel the token - signals all in-flight operations to abort
         self.shutdown_token.cancel();
 
-        // Only attempt graceful shutdown for boxes that should have a live
-        // shim. Calling live_state() on Configured/Failed would route
-        // through the restart pipeline and spawn a new VM — exactly what
-        // stop() must NOT do.
+        // Only stop boxes that should have a live shim. Calling live_state() on
+        // Configured/Failed would route through restart and spawn a new VM.
+        // The handler owns the complete graceful sequence: signal shim → guest
+        // teardown/sync/reset → libkrun return → bounded hard-kill fallback.
         let should_attach = self.state.read().status == BoxStatus::Running;
         if should_attach && let Ok(live) = self.ensure_booted().await {
-            // Recovered boxes lazy-attach here via vmm_attach (now
-            // ProcessIdentity-gated). Live boxes hit the cached LiveState.
-            // Either way the teardown is identical:
-            let guest_shutdown = async {
-                if let Ok(mut guest) = live.guest_session.guest().await {
-                    let _ = guest.shutdown().await;
-                }
-            };
-            if tokio::time::timeout(Duration::from_secs(10), guest_shutdown)
-                .await
-                .is_err()
-            {
-                tracing::warn!(box_id = %self.config.id, "Guest shutdown timed out after 10s");
-            }
-
-            // Stop handler
             if let Ok(mut handler) = live.handler.lock() {
                 handler.stop()?;
             }
@@ -1439,6 +1448,10 @@ impl crate::runtime::backend::BoxBackend for BoxImpl {
         self.start().await
     }
 
+    async fn start_and_wait(&self) -> BoxliteResult<()> {
+        self.start_and_wait().await
+    }
+
     async fn exec(&self, command: BoxCommand) -> BoxliteResult<Execution> {
         self.exec(command).await
     }
@@ -1852,6 +1865,35 @@ mod tests {
             .await
             .expect("idempotent explicit start failed");
         wait_for_background_starts(&fixture.box_impl, 3).await;
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.listener.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_and_wait_blocks_until_container_start_rpc_finishes() {
+        let gate = Arc::new(StartGate::default());
+        let fixture = running_box_for_start_test(Arc::clone(&gate)).await;
+        let box_impl = Arc::clone(&fixture.box_impl);
+        let start = tokio::spawn(async move { box_impl.start_and_wait().await });
+
+        gate.entered
+            .acquire()
+            .await
+            .expect("entered semaphore closed")
+            .forget();
+        assert!(
+            !start.is_finished(),
+            "start_and_wait returned before Container.Start"
+        );
+
+        gate.release.add_permits(1);
+        start
+            .await
+            .expect("start_and_wait task panicked")
+            .expect("start_and_wait failed");
+        tokio::time::timeout(Duration::from_secs(5), fixture.listener.wait_for(1))
+            .await
+            .expect("successful Container.Start did not emit started event");
         assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.listener.count.load(Ordering::SeqCst), 1);
     }

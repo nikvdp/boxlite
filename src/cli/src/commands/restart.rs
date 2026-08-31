@@ -41,7 +41,7 @@ pub async fn execute(args: RestartArgs, global: &crate::cli::GlobalFlags) -> any
             }
         };
 
-        if let Err(e) = litebox.start().await {
+        if let Err(e) = litebox.start_and_wait().await {
             eprintln!("Error restarting box '{}': {}", target, e);
             errors.push(format!("{}: {}", target, e));
         } else {

@@ -215,8 +215,9 @@ fn run_shim(mut config: InstanceSpec, timing: impl Fn(&str)) -> BoxliteResult<()
 
     tracing::info!("Box instance created, handing over process control to Box");
 
-    // Install SIGTERM handler for graceful shutdown (all boxes, detached or not).
-    // When SIGTERM is received: Guest.Shutdown() RPC (flush qcow2) → re-raise SIGTERM.
+    // Install SIGTERM handling for graceful shutdown. The guest syncs and
+    // resets the VM, allowing krun_start_enter to return and flush host-side
+    // qcow2 state; the shim is force-terminated only if that RPC fails.
     install_graceful_shutdown_handler(transport);
 
     // Start parent watchdog if detach=false.
@@ -251,15 +252,13 @@ const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 /// Timeout for guest RPC shutdown (filesystem sync) in seconds.
 const GUEST_SHUTDOWN_TIMEOUT_SECS: u64 = 3;
 
-/// Install SIGTERM handler for graceful VM shutdown.
+/// Install SIGTERM handling for graceful VM shutdown.
 ///
-/// Uses `signal-hook` to catch SIGTERM in a dedicated thread.
-/// When received: Guest.Shutdown() RPC (flush qcow2) → re-raise SIGTERM.
-///
-/// This ensures any SIGTERM source (runtime shutdown, watchdog, systemd, manual kill)
-/// triggers a graceful guest shutdown with filesystem sync. Without this handler,
-/// SIGTERM would immediately kill the process, risking qcow2 COW disk buffer loss
-/// and ext4 filesystem corruption on next restart.
+/// On SIGTERM, ask the guest to stop containers, sync filesystems, and reset
+/// the VM. The reset makes `krun_start_enter` return normally, which gives
+/// libkrun a chance to close and flush its host-side qcow2 backend. If the RPC
+/// cannot be completed, restore SIGTERM's default action and terminate rather
+/// than leave an unresponsive shim running indefinitely.
 fn install_graceful_shutdown_handler(transport: boxlite_shared::BoxTransport) {
     use signal_hook::consts::signal::SIGTERM;
     use signal_hook::iterator::Signals;
@@ -273,7 +272,6 @@ fn install_graceful_shutdown_handler(transport: boxlite_shared::BoxTransport) {
     };
 
     thread::spawn(move || {
-        // Block until SIGTERM received
         for sig in signals.forever() {
             if sig == SIGTERM {
                 tracing::info!("SIGTERM received, initiating graceful guest shutdown");
@@ -281,38 +279,39 @@ fn install_graceful_shutdown_handler(transport: boxlite_shared::BoxTransport) {
             }
         }
 
-        // Guest.Shutdown() RPC — flush qcow2 buffers (critical for data integrity)
-        match tokio::runtime::Builder::new_current_thread()
+        let graceful = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
             Ok(rt) => {
                 let session = boxlite::GuestSession::new(transport);
-                let result = rt.block_on(async {
-                    tokio::time::timeout(Duration::from_secs(GUEST_SHUTDOWN_TIMEOUT_SECS), async {
-                        match session.guest().await {
-                            Ok(mut guest) => {
-                                let _ = guest.shutdown().await;
-                            }
-                            Err(e) => {
-                                tracing::debug!("Could not connect to guest for shutdown: {e}");
-                            }
-                        }
-                    })
+                rt.block_on(async {
+                    let Ok(mut guest) = session.guest().await else {
+                        return false;
+                    };
+                    // A completed RPC can carry a degraded quiesce status, but
+                    // the guest has already synced and scheduled VM reset by
+                    // then. Only a timeout means graceful teardown is unknown.
+                    tokio::time::timeout(
+                        Duration::from_secs(GUEST_SHUTDOWN_TIMEOUT_SECS),
+                        guest.shutdown(),
+                    )
                     .await
-                });
-                match result {
-                    Ok(()) => tracing::info!("Guest shutdown completed (filesystems synced)"),
-                    Err(_) => tracing::warn!(
-                        timeout_secs = GUEST_SHUTDOWN_TIMEOUT_SECS,
-                        "Guest shutdown timed out"
-                    ),
-                }
+                    .is_ok()
+                })
             }
-            Err(e) => tracing::warn!("Failed to build tokio runtime for guest shutdown: {e}"),
+            Err(e) => {
+                tracing::warn!("Failed to build tokio runtime for guest shutdown: {e}");
+                false
+            }
+        };
+
+        if graceful {
+            tracing::info!("Guest shutdown accepted; waiting for VM reset");
+            return;
         }
 
-        // Re-raise SIGTERM with default handler for correct exit status (128+15=143)
+        tracing::warn!("Guest shutdown failed or timed out; terminating shim");
         unsafe {
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
             libc::raise(libc::SIGTERM);
@@ -327,9 +326,8 @@ fn install_graceful_shutdown_handler(transport: boxlite_shared::BoxTransport) {
 /// the kernel closes the write end, delivering POLLHUP immediately — zero latency,
 /// works across PID/mount namespaces.
 ///
-/// On POLLHUP: sends SIGTERM to self. The SIGTERM handler
-/// ([`install_graceful_shutdown_handler`]) does the actual graceful shutdown
-/// (Guest.Shutdown() RPC → qcow2 flush → exit).
+/// On POLLHUP, sends SIGTERM to self. The SIGTERM handler asks the guest to
+/// sync and reset the VM; the reset unwinds libkrun and exits the shim.
 fn start_parent_watchdog() {
     thread::spawn(|| {
         let mut pollfd = libc::pollfd {

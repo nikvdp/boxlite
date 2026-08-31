@@ -305,6 +305,11 @@ impl Vmm for Krun {
                 config.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB),
             )?;
 
+            // Device-heavy x86_64 guests can exhaust the in-kernel IOAPIC's
+            // IRQ 5-15 allocation. The split irqchip exposes all 24 pins.
+            #[cfg(target_arch = "x86_64")]
+            ctx.split_irqchip(true)?;
+
             Self::set_kernel(&config, &ctx)?;
             if config.nested_virtualization {
                 ctx.enable_nested_virtualization()?;

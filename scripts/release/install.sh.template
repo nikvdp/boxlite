@@ -3,7 +3,7 @@
 #
 # Usage:
 #   curl -fsSL https://sh.boxlite.ai | sh
-#   curl -fsSL https://github.com/boxlite-ai/boxlite/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/nikvdp/boxlite/releases/latest/download/install.sh | sh
 #
 # Environment variables:
 #   BOXLITE_VERSION           Pin a specific tag (default: this script's CURRENT_VERSION)
@@ -14,6 +14,8 @@
 #                             only mode whose trust root is independent of the
 #                             release page (caller-supplied, e.g. read from
 #                             SHA256SUMS verified with `gh attestation verify`).
+#   BOXLITE_RELEASE_BASE_URL  Override the release directory URL. Intended for
+#                             local mirrors and release-pipeline verification.
 #   BOXLITE_DEBUG=1           Print every command
 #   BOXLITE_QUIET=1           Silence info output
 #
@@ -36,7 +38,7 @@
 
 set -eu
 
-REPO="boxlite-ai/boxlite"
+REPO="nikvdp/boxlite"
 CURRENT_VERSION="__VERSION__"
 
 # Checksums for CURRENT_VERSION, embedded at release time. Used as fast-path
@@ -117,7 +119,11 @@ sha256_check() {
 download() {
   # $1 = url, $2 = output path
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"
+    if [ -n "${BOXLITE_RELEASE_BASE_URL-}" ]; then
+      curl -fsSL -o "$2" "$1"
+    else
+      curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"
+    fi
   elif command -v wget >/dev/null 2>&1; then
     wget -qO "$2" "$1"
   else
@@ -135,7 +141,7 @@ main() {
   install_dir=${BOXLITE_INSTALL_DIR:-$HOME/.local/bin}
 
   archive="boxlite-cli-${version}-${target}.tar.gz"
-  base_url="https://github.com/${REPO}/releases/download/${version}"
+  base_url=${BOXLITE_RELEASE_BASE_URL:-https://github.com/${REPO}/releases/download/${version}}
 
   tmpdir=$(mktemp -d)
   # Staged binary lives inside install_dir so the final rename is on the same

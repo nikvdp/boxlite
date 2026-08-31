@@ -116,7 +116,7 @@ pub(in crate::commands::serve) async fn start_box(
         Err(resp) => return resp,
     };
 
-    if let Err(e) = litebox.start().await {
+    if let Err(e) = litebox.start_and_wait().await {
         return error_from_boxlite(&e);
     }
 

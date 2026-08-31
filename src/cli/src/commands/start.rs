@@ -23,7 +23,7 @@ pub async fn execute(args: StartArgs, global: &crate::cli::GlobalFlags) -> anyho
             }
         };
 
-        if let Err(e) = litebox.start().await {
+        if let Err(e) = litebox.start_and_wait().await {
             eprintln!("Error starting box '{}': {}", target, e);
             errors.push(format!("{}: {}", target, e));
         } else {

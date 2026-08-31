@@ -139,33 +139,57 @@ pub fn cgroup_path(box_id: &str) -> PathBuf {
     get_cgroup_base().join(BOXLITE_CGROUP).join(box_id)
 }
 
-/// Kill every process in a box's cgroup via cgroup v2 `cgroup.kill`.
+/// Gracefully stop the shim in a box's cgroup, then force-kill leftovers.
 ///
-/// Reaps the box's *entire* process tree atomically — the outer bwrap launcher,
-/// the inner pid-namespace bwrap, the shim, and the VM — regardless of
-/// pid-namespace or process-group structure. A single-pid `SIGKILL` of the
-/// recorded pid only hits the outer bwrap; a detached box's inner tree survives
-/// it, since #851 stopped applying `--die-with-parent` to detached boxes. The
-/// whole tree lives in the box's cgroup, so killing the cgroup by id reaps it
-/// even after `state.pid` has been cleared.
+/// Detached Linux boxes have an outer bwrap launcher and an inner pid-namespace
+/// tree containing the shim. The recorded PID names the outer launcher, while
+/// only the shim handles SIGTERM by syncing the guest and flushing libkrun's
+/// qcow2 buffers. Libkrun renames the shim's process title to `libkrun VM`, so
+/// identify it by `/proc/<pid>/exe`, wait for the tree to drain, and reserve
+/// `cgroup.kill` for the timeout or a stale tree with no shim.
 ///
-/// Best-effort and idempotent: a no-op if the cgroup is gone, already empty, or
-/// `cgroup.kill` is unavailable (kernel < 5.14 / cgroup v1 / no jailer). Returns
-/// `true` if the kill file was written.
+/// Best-effort and idempotent. Returns `true` when the cgroup existed and this
+/// function handled teardown, including an already-empty cgroup. Returns
+/// `false` when no usable box cgroup exists, allowing the caller to fall back
+/// to its recorded process handle.
 ///
-/// Takes a [`BoxID`] rather than a raw `&str` on purpose: this writes to a path
-/// derived from the id, so it must be a safe single path component. `BoxID`'s
-/// constructor ([`BoxID::parse`]/mint) is the one choke point that guarantees
-/// that — its charset (`[A-Za-z0-9_-]`) excludes `/`, `\`, and `.`, so `..`/`.`
-/// and path separators are unrepresentable. The type carries the guarantee, so
-/// no per-call traversal check is needed (or could drift) here.
-///
-/// `pub(super)` on purpose: this is the cgroup *mechanism*, reached only through
-/// the jailer's [`super::reap_box`] facade. Layers above the jailer (box,
-/// runtime) reap by box semantics and never name cgroups.
-pub(super) fn kill_cgroup(box_id: &BoxID) -> bool {
-    let kill_file = cgroup_path(box_id.as_str()).join("cgroup.kill");
-    std::fs::write(&kill_file, "1").is_ok()
+/// Takes a [`BoxID`] rather than a raw `&str` because the id is used as a path
+/// component. [`BoxID::parse`] guarantees that separators and dot components
+/// are unrepresentable.
+pub(super) fn reap_cgroup(box_id: &BoxID) -> bool {
+    const GRACEFUL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let cgroup = cgroup_path(box_id.as_str());
+    let procs_file = cgroup.join("cgroup.procs");
+    let Ok(procs) = std::fs::read_to_string(&procs_file) else {
+        return false;
+    };
+
+    let shim_pid = procs.lines().find_map(|line| {
+        let pid = line.parse::<i32>().ok()?;
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        (exe.file_name() == Some(std::ffi::OsStr::new("boxlite-shim"))).then_some(pid)
+    });
+
+    if let Some(pid) = shim_pid {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::read_to_string(&procs_file) {
+                Ok(procs) if procs.trim().is_empty() => return true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+                Err(_) => break,
+                _ if started.elapsed() >= GRACEFUL_TIMEOUT => break,
+                _ => std::thread::sleep(POLL_INTERVAL),
+            }
+        }
+    }
+
+    std::fs::write(cgroup.join("cgroup.kill"), "1").is_ok()
 }
 
 /// Setup cgroup for a box.
@@ -456,23 +480,18 @@ mod tests {
     }
 
     #[test]
-    fn kill_cgroup_absent_is_noop() {
-        // No cgroup exists for this id, so `cgroup.kill` can't be written:
-        // kill_cgroup must report `false` and not panic. This locks the
-        // best-effort/idempotent contract relied on by the no-jailer and
-        // macOS-seatbelt paths (where there is no box cgroup to kill).
+    fn reap_cgroup_absent_is_noop() {
+        // No cgroup exists for this id, so the caller must retain its fallback
+        // process teardown path.
         let box_id = BoxID::parse("nonexistentbox000000000000").expect("valid id");
         assert!(
-            !kill_cgroup(&box_id),
-            "kill_cgroup must be a no-op (false) when the box has no cgroup"
+            !reap_cgroup(&box_id),
+            "reap_cgroup must report false when the box has no cgroup"
         );
     }
 
-    // Note: there is no `kill_cgroup_rejects_non_component_box_ids` test anymore.
-    // The path-traversal guard moved into the type: `kill_cgroup` takes a
-    // `BoxID`, and `BoxID::parse` already rejects `/`, `\`, `.`, `..`, and empty
-    // ids (see `id::tests::test_parse_rejects_unsafe_characters`). A non-component
-    // id is now unrepresentable at this call site, not merely rejected at runtime.
+    // A non-component id is unrepresentable here: `reap_cgroup` takes a
+    // `BoxID`, and `BoxID::parse` rejects separators and dot components.
 
     #[test]
     fn test_cgroup_config_from_limits() {

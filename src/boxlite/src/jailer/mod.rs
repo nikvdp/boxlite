@@ -93,16 +93,16 @@ pub use sandbox::{
 // Teardown facade
 // ============================================================================
 
-/// Reap any OS processes still belonging to a box's sandbox (best-effort).
+/// Gracefully stop OS processes belonging to a box's sandbox (best-effort).
 ///
 /// The semantic teardown entry for the isolation layer: callers name the
-/// *box*, not the mechanism, so nothing above the jailer has to know how a box
-/// is confined. On Linux the box's whole process tree lives in its cgroup, so
-/// this reaps it by id; on platforms with no host-side sandbox tree it is a
-/// no-op. Idempotent — safe on an already-stopped or never-started box.
+/// *box*, not the mechanism. On Linux the box's process tree lives in its
+/// cgroup, so this signals the shim, waits for guest sync and process exit,
+/// then force-kills leftovers. Returns whether the jailer handled teardown;
+/// callers retain a recorded-PID fallback for boxes without cgroups.
 #[cfg(target_os = "linux")]
 pub(crate) fn reap_box(box_id: &crate::runtime::id::BoxID) -> bool {
-    cgroup::kill_cgroup(box_id)
+    cgroup::reap_cgroup(box_id)
 }
 
 /// See the Linux variant. No host-side sandbox process tree to reap here.

@@ -167,15 +167,22 @@ impl GuestService for GuestServer {
             nix::libc::sync();
         }
 
+        // The host cannot safely kill the shim after this RPC: libkrun still
+        // owns qcow2 buffers until the VM exits and krun_start_enter returns.
+        // Return the RPC response first, then issue the same reset used by the
+        // normal init-exit path. Every supported VMM traps RESTART as shutdown.
+        schedule_vm_shutdown();
+
         // Report the degraded quiesce only now that containers are stopped,
-        // exit records are written and the filesystems are synced.
+        // exit records are written, filesystems are synced, and VM exit is
+        // scheduled. The guest still powers off on this error path.
         if let Err(error) = quiesce {
             return Err(Status::deadline_exceeded(format!(
                 "guest teardown completed but SSH sessions did not quiesce: {error}"
             )));
         }
 
-        info!("Graceful shutdown complete");
+        info!("Graceful shutdown complete; VM exit scheduled");
         Ok(Response::new(ShutdownResponse {}))
     }
 
@@ -212,6 +219,20 @@ impl GuestService for GuestServer {
         Ok(Response::new(ThawResponse { thawed_count }))
     }
 }
+
+#[cfg(not(test))]
+fn schedule_vm_shutdown() {
+    std::thread::spawn(|| {
+        // Let tonic flush the Shutdown response before the VM disappears.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        unsafe {
+            nix::libc::reboot(nix::libc::LINUX_REBOOT_CMD_RESTART);
+        }
+    });
+}
+
+#[cfg(test)]
+fn schedule_vm_shutdown() {}
 
 #[cfg(test)]
 mod tests {
